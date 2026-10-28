@@ -1,0 +1,18 @@
+[project]
+name = "influxdb"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+authors = [
+    { name = "Lalji Lenovo", email = "lg@gmail.com" }
+]
+requires-python = ">=3.14"
+dependencies = [
+    "influxdb3-python>=0.21.0",
+    "nicegui>=3.18.0",
+    "pandas>=3.1.0",
+    "pymodbus>=3.16.1",
+    "python-dotenv>=1.2.4",
+]
+
+
