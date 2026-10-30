@@ -1,0 +1,11 @@
+{
+    "Application": "TeamViewer",
+    "app_path": "C:\\IMA\\Python\\Python\\AutomateWindows\\dist\\SaveMouseCoordinate.exe",
+    "SleepTime": 10,
+    "target_x": 993,
+    "target_y": 56,
+    "target_x1": 1058,
+    "target_y1": 602,
+    "uptime_threshold": 111
+
+}
