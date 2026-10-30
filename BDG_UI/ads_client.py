@@ -39,7 +39,7 @@ class AdsError(Exception):
     """Raised when an ADS operation fails."""
 
 
-@dataclass(frozen=True) #  makes the instances of your data class immutable (read-only)
+@dataclass(frozen=True)
 class PlcVariable:
     name: str          # full symbol path in the PLC
     type: str          # e.g. "BOOL"
@@ -50,7 +50,7 @@ class PlcVariable:
 class AdsConfig:
     ams_id: str
     port: int
-    variables: tuple[PlcVariable, ...] # ... means tuple can have zero, one, or many elements
+    variables: tuple[PlcVariable, ...]
 
     @classmethod
     def from_file(cls, path: str | Path) -> "AdsConfig":
@@ -150,6 +150,30 @@ class AdsClient:
 
         loop = asyncio.get_running_loop()
         return await loop.run_in_executor(self._executor, self.read_many, names)
+
+    def write_many(self, values: dict[str, Any]) -> None:
+        """Blocking batched write (one ADS round-trip) of several variables."""
+        for name in values:
+            if name not in self._types:
+                raise AdsError(f"Variable not in config: {name}")
+        with self._lock:
+            if self._conn is None or not self._conn.is_open:
+                raise AdsError("Not connected to the PLC. Press Connect first.")
+            try:
+                result = self._conn.write_list_by_name(values)
+            except pyads.ADSError as exc:
+                log.warning("ADS batch write failed: %s", exc)
+                self._close_unlocked()
+                raise AdsError(f"Write failed: {exc}") from exc
+        failed = {n: r for n, r in result.items() if str(r).lower() != "no error"}
+        if failed:
+            raise AdsError(f"{len(failed)} variable(s) could not be written: {next(iter(failed.values()))}")
+
+    async def write_many_async(self, values: dict[str, Any]) -> None:
+        import asyncio
+
+        loop = asyncio.get_running_loop()
+        await loop.run_in_executor(self._executor, self.write_many, values)
 
     async def write_async(self, name: str, value: Any) -> None:
         """Non-blocking write for use from async code (NiceGUI handlers)."""

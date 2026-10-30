@@ -133,27 +133,29 @@ body {
   padding: 0 24px !important; border-radius: 18px !important;
 }
 
-/* Rotating rainbow ring + neon glow around the Connect button.
+.q-btn.glass-btn.glass-connect::after { border-radius: 15px 15px 50% 50% / 15px 15px 30% 30%; }  /* normal glass sheen */
+
+/* Rotating rainbow ring + neon glow: ONLY while connected to the PLC (class .is-connected).
    --ring-angle is animated through @property (Chrome/Edge, Safari 16.4+, Firefox 128+);
    older browsers simply show the ring without rotation. */
 @property --ring-angle { syntax: "<angle>"; initial-value: 0deg; inherits: false; }
 @keyframes ring-spin { to { --ring-angle: 360deg; } }
-.q-btn.glass-btn.glass-connect::before,
-.q-btn.glass-btn.glass-connect::after {
+.q-btn.glass-btn.glass-connect.is-connected::before,
+.q-btn.glass-btn.glass-connect.is-connected::after {
   --ring: conic-gradient(from var(--ring-angle),
     #ff7a18, #ffd200, #3df27a, #00e0ff, #3df27a, #ffd200, #ff7a18);
   background: var(--ring);
   animation: ring-spin 4s linear infinite;
 }
-.q-btn.glass-btn.glass-connect::before { padding: 2px; }          /* crisp 2px ring */
-.q-btn.glass-btn.glass-connect::after {                           /* blurred copy = glow */
+.q-btn.glass-btn.glass-connect.is-connected::before { padding: 2px; }          /* crisp 2px ring */
+.q-btn.glass-btn.glass-connect.is-connected::after {                           /* blurred copy = glow */
   top: -2px; left: -2px; width: calc(100% + 4px); height: calc(100% + 4px);
   border-radius: 20px; box-sizing: border-box; padding: 4px; opacity: .95; filter: blur(9px);
   -webkit-mask: linear-gradient(#000 0 0) content-box, linear-gradient(#000 0 0);
   -webkit-mask-composite: xor; mask: linear-gradient(#000 0 0) content-box exclude, linear-gradient(#000 0 0);
   mask-composite: exclude;
 }
-.q-btn.glass-btn.glass-connect:active::after { opacity: .7; }
+.q-btn.glass-btn.glass-connect.is-connected:active::after { opacity: .7; }
 
 .glass-connect .q-icon { font-size: 1.2rem; margin: 0 8px 0 0; }
 
@@ -169,7 +171,7 @@ body {
   box-shadow: 0 0 10px var(--bad), inset 0 1px 1px rgba(255,255,255,.5); }
 
 @media (prefers-reduced-motion: reduce) {
-  .q-btn.glass-btn.glass-connect::before, .q-btn.glass-btn.glass-connect::after { animation: none; }
+  .q-btn.glass-btn.glass-connect.is-connected::before, .q-btn.glass-btn.glass-connect.is-connected::after { animation: none; }
   .q-btn.glass-btn { transition: none; }
   .q-btn.glass-btn:hover { transform: none; }
 }
@@ -240,6 +242,10 @@ async def index() -> None:
         dot.style(f"background: {colour}; box-shadow: 0 0 10px {colour}, inset 0 1px 1px rgba(255,255,255,.5)")
         status.set_text(f"PLC connected ({config.ams_id}:{config.port})" if ok else "PLC offline")
         connect_btn.set_text("Disconnect" if ok else "Connect")
+        if ok:
+            connect_btn.classes(add="is-connected")      # rotating glowing ring on
+        else:
+            connect_btn.classes(remove="is-connected")   # back to plain glass
         for b in plc_buttons:
             b.set_enabled(ok)
         if ok and toggle_buttons:
@@ -302,4 +308,4 @@ async def index() -> None:
 app.on_shutdown(plc.close)
 
 if __name__ in {"__main__", "__mp_main__"}:  # guard required when packaged as .exe
-    ui.run(title="Roll magazine control", port=8080, reload=False, show=False)
+    ui.run(title="Roll magazine control", port=8080, reload=True)

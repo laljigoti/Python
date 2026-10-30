@@ -8,4 +8,5 @@ dependencies = [
     "nicegui>=3.18.0",
     "pyads>=3.6.0",
     "pyinstaller>=6.22.3",
+    "pywebview>=6.2.1",
 ]
