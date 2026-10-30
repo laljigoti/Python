@@ -53,6 +53,7 @@ body { background: var(--bg); color: var(--ink); font-family: 'Segoe UI', system
   touch-action: manipulation; user-select: none; -webkit-user-select: none;
 }
 .neu-btn .q-icon { font-size: 1.5rem; margin-bottom: 2px; }
+.q-btn.neu-btn .q-icon { color: var(--ok) !important; }   /* icon colour */
 .neu-btn:active, .neu-btn.is-down {
   box-shadow: inset 4px 4px 8px var(--lo), inset -4px -4px 8px var(--hi) !important;
   transform: scale(.985);
@@ -193,5 +194,6 @@ async def index() -> None:
 
 app.on_shutdown(plc.close)
 
+
 if __name__ in {"__main__", "__mp_main__"}:  # guard required when packaged as .exe
-    ui.run(title="Roll magazine control", port=8080, reload=False)
+    ui.run(title="Roll magazine control", port=8080, reload=True, favicon="./asset/Detective.ico")

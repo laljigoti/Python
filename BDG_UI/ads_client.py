@@ -39,7 +39,7 @@ class AdsError(Exception):
     """Raised when an ADS operation fails."""
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) #  makes the instances of your data class immutable (read-only)
 class PlcVariable:
     name: str          # full symbol path in the PLC
     type: str          # e.g. "BOOL"
@@ -50,7 +50,7 @@ class PlcVariable:
 class AdsConfig:
     ams_id: str
     port: int
-    variables: tuple[PlcVariable, ...]
+    variables: tuple[PlcVariable, ...] # ... means tuple can have zero, one, or many elements
 
     @classmethod
     def from_file(cls, path: str | Path) -> "AdsConfig":
