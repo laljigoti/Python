@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import logging
 import sys
+from datetime import datetime
 from pathlib import Path
 
 from nicegui import app, ui
@@ -174,6 +175,15 @@ body {
 @media (max-width: 900px)  { .glass-grid { grid-template-columns: repeat(6, var(--btn-w)); } }
 @media (max-width: 600px)  { .glass-grid { grid-template-columns: repeat(3, var(--btn-w)); justify-content: center; } }
 
+/* ---- log panel ---- */
+.nicegui-log.glass-log {
+  height: 170px; padding: 10px 14px !important; border-radius: 16px !important;
+  background: rgba(0,0,0,.30) !important; color: rgba(255,255,255,.88) !important;
+  border: 1px solid rgba(255,255,255,.08) !important;
+  box-shadow: inset 0 2px 8px rgba(0,0,0,.40);
+  font-family: Consolas, 'Cascadia Mono', monospace; font-size: .85rem; line-height: 1.5;
+}
+
 /* ---- status ---- */
 .status-dot { width: 14px; height: 14px; border-radius: 50%; background: var(--bad);
   box-shadow: 0 0 10px var(--bad), inset 0 1px 1px rgba(255,255,255,.5); }
@@ -203,22 +213,42 @@ async def index() -> None:
     toggle_buttons: dict[str, ui.button] = {}    # PLC variable name -> toggle button
     toggle_state: dict[str, bool] = {}           # last known PLC value
     master_btn: ui.button | None = None          # "Clamp all / Release all" button
+    log_el: ui.log | None = None                 # log panel at the bottom
+    labels: dict[str, str] = {}                  # PLC variable name -> short label for the log ("Clamp 3")
+    conn_state: dict[str, bool | None] = {"ok": None}   # last seen connection state
+
+    LOG_CLASSES = {"info": "text-grey-4", "ok": "text-green-4", "warn": "text-orange-4", "error": "text-red-4"}
+
+    def log_msg(text: str, level: str = "info") -> None:
+        """Append a time-stamped line to the log panel."""
+        if log_el is None:
+            return
+        line = f"{datetime.now():%H:%M:%S}  {text}"
+        try:
+            log_el.push(line, classes=LOG_CLASSES.get(level, ""))
+        except TypeError:          # older NiceGUI without the classes argument
+            log_el.push(line)
 
     # ---- hold buttons -------------------------------------------------------
-    async def write(name: str, value: bool) -> None:
+    async def write(name: str, value: bool) -> bool:
         try:
             await plc.write_async(name, value)
         except AdsError as exc:
             ui.notify(str(exc), type="negative", position="top", timeout=4000)
+            log_msg(f"{labels.get(name, name)}: {exc}", "error")
+            return False
+        return True
 
     async def press(var_name: str) -> None:
         pressed.add(var_name)
-        await write(var_name, True)
+        if await write(var_name, True):
+            log_msg(f"{labels.get(var_name, var_name)} pressed")
 
     async def release(var_name: str) -> None:
         if var_name in pressed:                  # ignore duplicate up/leave/cancel events
             pressed.discard(var_name)
-            await write(var_name, False)
+            if await write(var_name, False):
+                log_msg(f"{labels.get(var_name, var_name)} released")
 
     async def release_all() -> None:             # browser closed / link lost while holding a button
         for name in list(pressed):
@@ -255,9 +285,11 @@ async def index() -> None:
             await plc.write_many_async({n: target for n in names})
         except AdsError as exc:
             ui.notify(str(exc), type="negative", position="top", timeout=4000)
+            log_msg(f"Clamp all: {exc}", "error")
             return
         for n in names:
             show_state(n, target)
+        log_msg(f"All {len(names)} clamps -> {'ON' if target else 'OFF'}", "ok" if target else "info")
 
     async def toggle(name: str) -> None:
         new = not toggle_state.get(name, False)
@@ -265,12 +297,17 @@ async def index() -> None:
             await plc.write_async(name, new)
         except AdsError as exc:
             ui.notify(str(exc), type="negative", position="top", timeout=4000)
+            log_msg(f"{labels.get(name, name)}: {exc}", "error")
             return
         show_state(name, new)
+        log_msg(f"{labels.get(name, name)} -> {'ON' if new else 'OFF'}", "ok" if new else "info")
 
     # ---- connection / status ------------------------------------------------
     async def refresh_status() -> None:
         ok = await plc.connected_async()
+        if conn_state["ok"] != ok and (conn_state["ok"] is not None or ok):
+            log_msg("PLC online" if ok else "PLC offline", "ok" if ok else "warn")
+        conn_state["ok"] = ok
         colour = "var(--ok)" if ok else "var(--bad)"
         dot.style(f"background: {colour}; box-shadow: 0 0 10px {colour}, inset 0 1px 1px rgba(255,255,255,.5)")
         status.set_text(f"PLC connected ({config.ams_id}:{config.port})" if ok else "PLC offline")
@@ -296,14 +333,17 @@ async def index() -> None:
         connect_btn.disable()
         try:
             if await plc.connected_async():
+                log_msg("Disconnecting from PLC...")
                 await release_all()
                 await plc.disconnect_async()
                 ui.notify("Disconnected from PLC", type="info", position="top")
             else:
+                log_msg(f"Connecting to {config.ams_id}:{config.port} ...")
                 await plc.connect_async()
                 ui.notify("Connected to PLC", type="positive", position="top")
         except AdsError as exc:
             ui.notify(str(exc), type="negative", position="top", timeout=5000)
+            log_msg(str(exc), "error")
         finally:
             connect_btn.enable()
             await refresh_status()
@@ -330,6 +370,7 @@ async def index() -> None:
                 with ui.element("div").classes("glass-grid"):
                     for var in (v for v in config.variables if key in v.name):
                         btn = glass_button(var.display_name, icon, stack=False)
+                        labels[var.name] = f"{'Clamp' if mode == 'toggle' else 'Park'} {var.display_name}"
                         plc_buttons.append(btn)
                         if mode == "toggle":
                             toggle_buttons[var.name] = btn
@@ -339,7 +380,15 @@ async def index() -> None:
                             for ev in ("pointerup", "pointerleave", "pointercancel"):
                                 btn.on(ev, lambda _e, n=var.name: release(n))
 
+            # Bottom: log panel
+            with ui.row().classes("w-full items-center justify-between q-mt-lg q-mb-sm"):
+                ui.label("Log").classes("text-subtitle1 text-weight-medium glass-sub")
+                clear_btn = glass_button("Clear", "delete_sweep").classes("glass-wide")
+                clear_btn.on_click(lambda: log_el.clear())
+            log_el = ui.log(max_lines=300).classes("glass-log w-full")
+
     ui.timer(2.0, refresh_status)
+    log_msg("Application ready. Press Connect to start ADS communication.")
 
 
 app.on_shutdown(plc.close)

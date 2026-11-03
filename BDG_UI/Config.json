@@ -1,5 +1,5 @@
 {
-    "plc_ams_id": "192.168.2.139.1.1",
+    "plc_ams_id": "192.168.2.199.1.1",
     "plc_port": 851,
     "PLC_Var": [
         {"name": "GVL.un01D2133T01Magazine.su01RollMagazine.fg01Track.fb01TrackBasic.stOperating.stManuellClamping.bPressed", "type": "BOOL", "display_name": "1"},
