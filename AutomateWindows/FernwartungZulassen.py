@@ -33,10 +33,10 @@ def activate_and_click():
     target_y = config.get("target_y", 56)
     target_x1 = config.get("target_x1", 1058)
     target_y1 = config.get("target_y1", 602)
-      # Default to 120 seconds if not specified
+
     print(f"Searching for window titled '{Application}'...")
     windows = gw.getWindowsWithTitle(Application)
-    
+
     # Safe check if window is missing
     if not windows:
         print(f"Window titled '{Application}' not found. Waiting 20 seconds...")
@@ -45,35 +45,45 @@ def activate_and_click():
         if not windows:
             print(f"Error: Window '{Application}' still not found. Exiting.")
             return False
-    
+
     win = windows[0]
-    
+
+    # --- Minimize all other windows first ---
+    print("Minimizing all windows...")
+    for w in gw.getAllWindows():
+        try:
+            # Skip windows without a title and the target window itself
+            #if w.title and w._hWnd != win._hWnd and not w.isMinimized:
+                w.minimize()
+        except Exception:
+            # Some system windows can't be minimized, ignore them
+            pass
+    time.sleep(2)
+
+    # --- Restore and activate the target application ---
     if win.isMinimized:
         win.restore()
-        time.sleep(1)
-    
-    # Bypass Windows focus restriction (Error 5) by simulating a click 
-    # on the window's title bar or area to bring it to the foreground safely
+        time.sleep(2)
+
     try:
         win.activate()
         print(f"Window titled '{Application}' activated successfully.")
-    except Exception as e:
-        print(f"Direct activation blocked by Windows security. Using click fallback...")
-        # Fallback: Click near the top of the window frame to focus it safely
+    except Exception:
+        print("Direct activation blocked by Windows security. Using click fallback...")
         pyautogui.click(win.left + 100, win.top + 10)
-    
+
     time.sleep(1)
-    
+
     # Move the mouse cursor to the first position
     pyautogui.moveTo(target_x, target_y, duration=0.5)
     print(f"Moved mouse to screen coordinates X={target_x}, Y={target_y}. Waiting for 3 seconds...")
-    
+
     time.sleep(3)
-    
+
     # Click the first position
     pyautogui.click()
     time.sleep(1)
-    
+
     # Move and click the second position
     pyautogui.moveTo(target_x1, target_y1, duration=0.5)
     pyautogui.click()
