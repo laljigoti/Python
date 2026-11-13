@@ -1,20 +1,35 @@
-"""NiceGUI front-end (glassmorphism): header + 24 Clamp toggles + 24 Park hold-buttons.
+"""NiceGUI front-end (glassmorphism): header + Clamp toggles + Park hold-buttons.
 
 Backend: TwinCAT PLC over ADS (see ads_client.py).
 Config.json must be in the same folder as the .exe (or as this script when run with uv).
+
+How the page works
+------------------
+* ``ROWS`` describes the button groups. Each group collects the PLC variables
+  whose name contains ``RowSpec.key`` and renders one button per variable.
+* "toggle" buttons switch a PLC bool on/off. Their state is *mirrored from the
+  PLC* every poll cycle, so the UI can never show a wrong state.
+* "hold" buttons write TRUE on pointer-down and FALSE on release.
+* All PLC access goes through ``AdsClient``'s ``*_async`` methods, which run on
+  one worker thread. That keeps the UI responsive and guarantees write order.
 """
 from __future__ import annotations
 
+import base64
 import logging
 import sys
 from datetime import datetime
 from pathlib import Path
+from typing import Awaitable, NamedTuple
 
 from nicegui import app, ui
 
 from ads_client import AdsClient, AdsConfig, AdsError
 
 logging.basicConfig(level=logging.INFO)
+
+POLL_INTERVAL_S = 2.0   # how often every open browser page checks the PLC
+NOTIFY_MS = 4000        # how long error pop-ups stay visible
 
 
 # --------------------------------------------------------------------------- config
@@ -27,6 +42,7 @@ def app_dir() -> Path:
 
 CONFIG_PATH = app_dir() / "Config.json"
 
+# Fail fast with a readable message instead of a traceback.
 try:
     config = AdsConfig.from_file(CONFIG_PATH)
 except FileNotFoundError:
@@ -36,14 +52,50 @@ except (ValueError, KeyError) as exc:
 
 plc = AdsClient(config)
 
-# Row definitions: (text found in the PLC variable name, row title, Material icon, mode)
-#   mode "toggle": click = switch on/off and stay (state is mirrored from the PLC)
-#   mode "hold"  : TRUE while the button is held, FALSE on release
-# display_name is just a number, so rows are grouped by the PLC variable name.
-ROWS = [
-    ("stManuellClamping", "Clamping", "compress", "toggle"),
-    ("stGoToParkPos", "Go to park position", "local_parking", "hold"),
-]
+
+class RowSpec(NamedTuple):
+    """One group of buttons on the page."""
+    key: str      # text searched for in the PLC variable name (display_name is only a number)
+    title: str    # row heading
+    icon: str     # Material icon name, or an "img:..." string for a custom icon (see svg_icon)
+    mode: str     # "toggle": click = switch on/off and stay (state mirrored from the PLC)
+                  # "hold"  : TRUE while the button is held, FALSE on release
+    prefix: str   # short word used in log lines, e.g. "Clamp 3"
+
+
+# --------------------------------------------------------------------------- custom icons
+def svg_icon(svg: str) -> str:
+    """Turn SVG markup into a value usable as ``icon=`` (Quasar's ``img:`` icon type).
+
+    The SVG is embedded as a base64 data URI, so no extra file has to ship next to
+    the .exe. Note: an SVG used this way is drawn like a picture, so it cannot
+    inherit the button's text colour -> the colour is written into the SVG itself.
+    """
+    encoded = base64.b64encode(svg.encode("utf-8")).decode("ascii")
+    return f"img:data:image/svg+xml;base64,{encoded}"
+
+
+# Roller clamp: two rollers (outer ring + inner hub) pressing on a vertical web/strip.
+# White strokes to match the other icons on the dark glass buttons.
+# The viewBox is slightly larger than the drawing (-5..105) so the round stroke ends aren't clipped.
+ROLLER_CLAMP_ICON = svg_icon(
+    """
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="-5 -5 110 110"
+         fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round">
+      <circle cx="24" cy="50" r="24"/>   <!-- left roller: outer ring -->
+      <circle cx="24" cy="50" r="11"/>   <!-- left roller: hub -->
+      <circle cx="76" cy="50" r="24"/>   <!-- right roller: outer ring -->
+      <circle cx="76" cy="50" r="11"/>   <!-- right roller: hub -->
+      <line x1="50" y1="0" x2="50" y2="100"/>   <!-- strip between the rollers -->
+    </svg>
+    """
+)
+
+ROWS = (
+    RowSpec("stManuellClamping", "Flat Clamping", "compress", "toggle", "FlatClamp"),
+    RowSpec("stFeedRollerClamping", "Roller Clamping", ROLLER_CLAMP_ICON, "toggle", "RollerClamp"),
+    RowSpec("stGoToParkPos", "Go to park position", "local_parking", "hold", "Park"),
+)
 
 # --------------------------------------------------------------------------- style
 CSS = r"""
@@ -195,203 +247,251 @@ body {
 }
 """
 
+LOG_CLASSES = {"info": "text-grey-4", "ok": "text-green-4", "warn": "text-orange-4", "error": "text-red-4"}
 
+
+# --------------------------------------------------------------------------- small helpers
 def glass_button(text: str, icon: str, *, stack: bool = False) -> ui.button:
     """Glass-styled button. color=None removes Quasar's default blue text colour."""
     props = "flat unelevated no-caps" + (" stack" if stack else "")
     return ui.button(text, icon=icon, color=None).props(props).classes("glass-btn")
 
 
+def set_class(element: ui.element, css_class: str, enabled: bool) -> None:
+    """Add or remove one CSS class depending on ``enabled``."""
+    if enabled:
+        element.classes(add=css_class)
+    else:
+        element.classes(remove=css_class)
+
+
 # --------------------------------------------------------------------------- page
-@ui.page("/")
-async def index() -> None:
-    ui.add_css(CSS)
-    ui.query("body").classes("q-pa-md")
+class ControlPanel:
+    """One instance per open browser page: builds the UI and owns its state."""
 
-    pressed: set[str] = set()                    # hold-type variables this browser currently holds TRUE
-    plc_buttons: list[ui.button] = []            # every PLC button (enabled only while connected)
-    toggle_buttons: dict[str, ui.button] = {}    # PLC variable name -> toggle button
-    toggle_state: dict[str, bool] = {}           # last known PLC value
-    master_btn: ui.button | None = None          # "Clamp all / Release all" button
-    log_el: ui.log | None = None                 # log panel at the bottom
-    labels: dict[str, str] = {}                  # PLC variable name -> short label for the log ("Clamp 3")
-    conn_state: dict[str, bool | None] = {"ok": None}   # last seen connection state
+    def __init__(self) -> None:
+        # ---- state (all per browser page) ----
+        self.pressed: set[str] = set()                  # hold-type variables this browser holds TRUE
+        self.plc_buttons: list[ui.button] = []          # every PLC button (enabled only while online)
+        self.toggle_buttons: dict[str, ui.button] = {}  # PLC variable name -> toggle button
+        self.toggle_state: dict[str, bool] = {}         # last known PLC value of each toggle
+        self.labels: dict[str, str] = {}                # PLC variable name -> log label ("Clamp 3")
+        self.master_btn: ui.button | None = None        # "Clamp all / Release all"
+        self.online: bool | None = None                 # last seen link state; None = not checked yet
 
-    LOG_CLASSES = {"info": "text-grey-4", "ok": "text-green-4", "warn": "text-orange-4", "error": "text-red-4"}
+        self._build_layout()
 
-    def log_msg(text: str, level: str = "info") -> None:
-        """Append a time-stamped line to the log panel."""
-        if log_el is None:
-            return
+        # Browser closed / link lost while holding a button -> release it.
+        # (Affects hold buttons only; toggles keep their state in the PLC.)
+        ui.context.client.on_disconnect(self.release_all)
+
+        ui.timer(0.1, self.refresh_status, once=True)   # first status check right away ...
+        ui.timer(POLL_INTERVAL_S, self.refresh_status)  # ... then keep polling
+        self.log("Application ready. Press Connect to start ADS communication.")
+
+    # ---- layout -------------------------------------------------------------
+    def _build_layout(self) -> None:
+        with ui.column().classes("w-full items-center"):
+            with ui.element("div").classes("glass-panel"):
+                self._build_header()
+                for spec in ROWS:
+                    self._build_row(spec)
+                self._build_log_panel()
+
+    def _build_header(self) -> None:
+        """Top row: connect button on the left, status dot + text on the right."""
+        with ui.row().classes("w-full items-center justify-between q-mb-lg"):
+            self.connect_btn = glass_button("Connect", "power").classes("glass-connect")
+            self.connect_btn.on_click(self.toggle_connection)
+            with ui.row().classes("items-center gap-2"):
+                self.dot = ui.element("div").classes("status-dot")
+                self.status = ui.label("Checking…")
+
+    def _build_row(self, spec: RowSpec) -> None:
+        """Heading (+ 'Clamp all' for toggle rows) and one button per matching PLC variable."""
+        with ui.row().classes("w-full items-center justify-between q-mt-md q-mb-sm"):
+            ui.label(spec.title).classes("text-subtitle1 text-weight-medium glass-sub")
+            if spec.mode == "toggle":
+                self.master_btn = glass_button("Clamp all", "lock").classes("glass-wide")
+                self.master_btn.on_click(self.toggle_all)
+                self.plc_buttons.append(self.master_btn)
+
+        with ui.element("div").classes("glass-grid"):
+            for var in (v for v in config.variables if spec.key in v.name):
+                btn = glass_button(var.display_name, spec.icon, stack=False)
+                self.labels[var.name] = f"{spec.prefix} {var.display_name}"
+                self.plc_buttons.append(btn)
+
+                if spec.mode == "toggle":
+                    self.toggle_buttons[var.name] = btn
+                    btn.on_click(lambda _e, n=var.name: self.toggle(n))
+                else:
+                    # Several events can end a press (finger slides off, touch cancelled, ...);
+                    # release() ignores the duplicates.
+                    btn.on("pointerdown", lambda _e, n=var.name: self.press(n))
+                    for event in ("pointerup", "pointerleave", "pointercancel"):
+                        btn.on(event, lambda _e, n=var.name: self.release(n))
+
+    def _build_log_panel(self) -> None:
+        with ui.row().classes("w-full items-center justify-between q-mt-lg q-mb-sm"):
+            ui.label("Log").classes("text-subtitle1 text-weight-medium glass-sub")
+            clear_btn = glass_button("Clear", "delete_sweep").classes("glass-wide")
+            clear_btn.on_click(lambda: self.log_el.clear())
+        self.log_el = ui.log(max_lines=300).classes("glass-log w-full")
+
+    # ---- logging / error reporting -----------------------------------------
+    def log(self, text: str, level: str = "info") -> None:
+        """Append a time-stamped, colour-coded line to the log panel."""
         line = f"{datetime.now():%H:%M:%S}  {text}"
         try:
-            log_el.push(line, classes=LOG_CLASSES.get(level, ""))
-        except TypeError:          # older NiceGUI without the classes argument
-            log_el.push(line)
+            self.log_el.push(line, classes=LOG_CLASSES.get(level, ""))
+        except TypeError:  # older NiceGUI without the classes argument
+            self.log_el.push(line)
 
-    # ---- hold buttons -------------------------------------------------------
-    async def write(name: str, value: bool) -> bool:
+    def report_error(self, exc: Exception, label: str = "", timeout: int = NOTIFY_MS) -> None:
+        """Show an error pop-up AND write it to the log."""
+        ui.notify(str(exc), type="negative", position="top", timeout=timeout)
+        self.log(f"{label}: {exc}" if label else str(exc), "error")
+
+    async def attempt(self, label: str, action: Awaitable[None]) -> bool:
+        """Await a PLC action; on AdsError report it and return False, else True."""
         try:
-            await plc.write_async(name, value)
+            await action
         except AdsError as exc:
-            ui.notify(str(exc), type="negative", position="top", timeout=4000)
-            log_msg(f"{labels.get(name, name)}: {exc}", "error")
+            self.report_error(exc, label)
             return False
         return True
 
-    async def press(var_name: str) -> None:
-        pressed.add(var_name)
-        if await write(var_name, True):
-            log_msg(f"{labels.get(var_name, var_name)} pressed")
+    # ---- hold buttons -------------------------------------------------------
+    async def press(self, name: str) -> None:
+        # Register BEFORE awaiting: if the pointer-up arrives while the write is still
+        # in flight, release() must see the button as held, otherwise the PLC would stay TRUE.
+        # The ADS worker thread is FIFO, so TRUE is always written before FALSE.
+        self.pressed.add(name)
+        if await self.attempt(self.labels[name], plc.write_async(name, True)):
+            self.log(f"{self.labels[name]} pressed")
+        else:
+            self.pressed.discard(name)  # nothing was written, so there is nothing to release
 
-    async def release(var_name: str) -> None:
-        if var_name in pressed:                  # ignore duplicate up/leave/cancel events
-            pressed.discard(var_name)
-            if await write(var_name, False):
-                log_msg(f"{labels.get(var_name, var_name)} released")
+    async def release(self, name: str) -> None:
+        if name not in self.pressed:  # ignore duplicate up/leave/cancel events
+            return
+        self.pressed.discard(name)
+        if await self.attempt(self.labels[name], plc.write_async(name, False)):
+            self.log(f"{self.labels[name]} released")
 
-    async def release_all() -> None:             # browser closed / link lost while holding a button
-        for name in list(pressed):
-            await release(name)
-
-    ui.context.client.on_disconnect(release_all)  # affects hold buttons only; toggles keep their state
+    async def release_all(self) -> None:
+        """Release every held button with ONE batched ADS write."""
+        names = list(self.pressed)
+        if not names:
+            return
+        self.pressed.clear()
+        if await self.attempt("Release", plc.write_many_async({n: False for n in names})):
+            self.log(f"Released {len(names)} held button(s)")
 
     # ---- toggle buttons -----------------------------------------------------
-    def show_state(name: str, on: bool) -> None:
-        toggle_state[name] = on
-        btn = toggle_buttons[name]
-        if on:
-            btn.classes(add="is-on")
-        else:
-            btn.classes(remove="is-on")
-        update_master()
+    @property
+    def all_clamped(self) -> bool:
+        return bool(self.toggle_buttons) and all(self.toggle_state.get(n, False) for n in self.toggle_buttons)
 
-    def update_master() -> None:
+    def apply_states(self, states: dict[str, bool]) -> None:
+        """Show PLC values on the toggle buttons. Only touches the UI for values that changed."""
+        changed = False
+        for name, on in states.items():
+            if self.toggle_state.get(name) != on:
+                self.toggle_state[name] = on
+                set_class(self.toggle_buttons[name], "is-on", on)
+                changed = True
+        if changed:
+            self.update_master()
+
+    def update_master(self) -> None:
         """Master button shows 'Release all' (green) when every clamp is on, else 'Clamp all'."""
-        if master_btn is None:
+        if self.master_btn is None:
             return
-        all_on = bool(toggle_buttons) and all(toggle_state.get(n, False) for n in toggle_buttons)
-        master_btn.set_text("Release all" if all_on else "Clamp all")
-        if all_on:
-            master_btn.classes(add="is-on")
-        else:
-            master_btn.classes(remove="is-on")
+        all_on = self.all_clamped
+        self.master_btn.set_text("Release all" if all_on else "Clamp all")
+        set_class(self.master_btn, "is-on", all_on)
 
-    async def toggle_all() -> None:
+    async def toggle(self, name: str) -> None:
+        new = not self.toggle_state.get(name, False)
+        if await self.attempt(self.labels[name], plc.write_async(name, new)):
+            self.apply_states({name: new})
+            self.log(f"{self.labels[name]} -> {'ON' if new else 'OFF'}", "ok" if new else "info")
+
+    async def toggle_all(self) -> None:
         """Not all clamps on -> switch ALL on.  All clamps on -> switch ALL off."""
-        names = list(toggle_buttons)
-        target = not all(toggle_state.get(n, False) for n in names)
-        try:
-            await plc.write_many_async({n: target for n in names})
-        except AdsError as exc:
-            ui.notify(str(exc), type="negative", position="top", timeout=4000)
-            log_msg(f"Clamp all: {exc}", "error")
-            return
-        for n in names:
-            show_state(n, target)
-        log_msg(f"All {len(names)} clamps -> {'ON' if target else 'OFF'}", "ok" if target else "info")
-
-    async def toggle(name: str) -> None:
-        new = not toggle_state.get(name, False)
-        try:
-            await plc.write_async(name, new)
-        except AdsError as exc:
-            ui.notify(str(exc), type="negative", position="top", timeout=4000)
-            log_msg(f"{labels.get(name, name)}: {exc}", "error")
-            return
-        show_state(name, new)
-        log_msg(f"{labels.get(name, name)} -> {'ON' if new else 'OFF'}", "ok" if new else "info")
+        target = not self.all_clamped
+        states = {name: target for name in self.toggle_buttons}
+        if await self.attempt("Clamp all", plc.write_many_async(states)):  # one ADS round-trip
+            self.apply_states(states)
+            self.log(f"All {len(states)} clamps -> {'ON' if target else 'OFF'}", "ok" if target else "info")
 
     # ---- connection / status ------------------------------------------------
-    async def refresh_status() -> None:
-        ok = await plc.connected_async()
-        if conn_state["ok"] != ok and (conn_state["ok"] is not None or ok):
-            log_msg("PLC online" if ok else "PLC offline", "ok" if ok else "warn")
-        conn_state["ok"] = ok
-        colour = "var(--ok)" if ok else "var(--bad)"
-        dot.style(f"background: {colour}; box-shadow: 0 0 10px {colour}, inset 0 1px 1px rgba(255,255,255,.5)")
-        status.set_text(f"PLC connected ({config.ams_id}:{config.port})" if ok else "PLC offline")
-        connect_btn.set_text("Disconnect" if ok else "Connect")
-        if ok:
-            connect_btn.classes(add="is-connected")      # rotating glowing ring on
-        else:
-            connect_btn.classes(remove="is-connected")   # back to plain glass
-        for b in plc_buttons:
-            b.set_enabled(ok)
-        if ok and toggle_buttons:
-            try:  # mirror the real PLC values so the buttons never show a wrong state
-                values = await plc.read_many_async(list(toggle_buttons))
-                for name, value in values.items():
-                    show_state(name, bool(value))
-            except AdsError:
-                pass  # link dropped; the next cycle shows "PLC offline"
-        elif not ok:
-            for name in toggle_buttons:
-                show_state(name, False)
+    async def poll_plc(self) -> tuple[bool, dict[str, bool]]:
+        """Return (link is alive, current toggle values).
 
-    async def toggle_connection() -> None:
-        connect_btn.disable()
+        When toggles exist ONE batched read answers both questions, so a poll
+        costs a single ADS round-trip. A failed read means the link is down.
+        """
+        if not self.toggle_buttons:
+            return await plc.connected_async(), {}
+        try:
+            values = await plc.read_many_async(list(self.toggle_buttons))
+        except AdsError:
+            return False, {}
+        return True, {name: bool(value) for name, value in values.items()}
+
+    async def refresh_status(self) -> None:
+        online, values = await self.poll_plc()
+
+        if online != self.online:  # connection widgets only change when the state flips
+            self.set_online(online)
+
+        # Offline -> show every toggle as OFF; online -> mirror the real PLC values.
+        self.apply_states(values if online else {name: False for name in self.toggle_buttons})
+
+    def set_online(self, online: bool) -> None:
+        """Update every widget that depends on the link state."""
+        if self.online is not None or online:  # don't log "offline" at start-up
+            self.log("PLC online" if online else "PLC offline", "ok" if online else "warn")
+        self.online = online
+
+        colour = "var(--ok)" if online else "var(--bad)"
+        self.dot.style(f"background: {colour}; box-shadow: 0 0 10px {colour}, inset 0 1px 1px rgba(255,255,255,.5)")
+        self.status.set_text(f"PLC connected ({config.ams_id}:{config.port})" if online else "PLC offline")
+        self.connect_btn.set_text("Disconnect" if online else "Connect")
+        set_class(self.connect_btn, "is-connected", online)  # rotating glowing ring
+        for btn in self.plc_buttons:
+            btn.set_enabled(online)
+
+    async def toggle_connection(self) -> None:
+        self.connect_btn.disable()  # no double clicks while connecting
         try:
             if await plc.connected_async():
-                log_msg("Disconnecting from PLC...")
-                await release_all()
+                self.log("Disconnecting from PLC...")
+                await self.release_all()  # never leave a hold button TRUE in the PLC
                 await plc.disconnect_async()
                 ui.notify("Disconnected from PLC", type="info", position="top")
             else:
-                log_msg(f"Connecting to {config.ams_id}:{config.port} ...")
+                self.log(f"Connecting to {config.ams_id}:{config.port} ...")
                 await plc.connect_async()
                 ui.notify("Connected to PLC", type="positive", position="top")
         except AdsError as exc:
-            ui.notify(str(exc), type="negative", position="top", timeout=5000)
-            log_msg(str(exc), "error")
+            self.report_error(exc, timeout=5000)
         finally:
-            connect_btn.enable()
-            await refresh_status()
-
-    # ---- layout -------------------------------------------------------------
-    with ui.column().classes("w-full items-center"):
-        with ui.element("div").classes("glass-panel"):
-            # Row 1: title | connect button | PLC status
-            with ui.row().classes("w-full items-center justify-between q-mb-lg"):
-                connect_btn = glass_button("Connect", "power").classes("glass-connect")
-                connect_btn.on_click(toggle_connection)
-                with ui.row().classes("items-center gap-2"):
-                    dot = ui.element("div").classes("status-dot")
-                    status = ui.label("Checking…")
-
-            # Rows 2 and 3: one button grid per PLC variable group
-            for key, title, icon, mode in ROWS:
-                with ui.row().classes("w-full items-center justify-between q-mt-md q-mb-sm"):
-                    ui.label(title).classes("text-subtitle1 text-weight-medium glass-sub")
-                    if mode == "toggle":
-                        master_btn = glass_button("Clamp all", "lock").classes("glass-wide")
-                        master_btn.on_click(toggle_all)
-                        plc_buttons.append(master_btn)
-                with ui.element("div").classes("glass-grid"):
-                    for var in (v for v in config.variables if key in v.name):
-                        btn = glass_button(var.display_name, icon, stack=False)
-                        labels[var.name] = f"{'Clamp' if mode == 'toggle' else 'Park'} {var.display_name}"
-                        plc_buttons.append(btn)
-                        if mode == "toggle":
-                            toggle_buttons[var.name] = btn
-                            btn.on_click(lambda _e, n=var.name: toggle(n))
-                        else:
-                            btn.on("pointerdown", lambda _e, n=var.name: press(n))
-                            for ev in ("pointerup", "pointerleave", "pointercancel"):
-                                btn.on(ev, lambda _e, n=var.name: release(n))
-
-            # Bottom: log panel
-            with ui.row().classes("w-full items-center justify-between q-mt-lg q-mb-sm"):
-                ui.label("Log").classes("text-subtitle1 text-weight-medium glass-sub")
-                clear_btn = glass_button("Clear", "delete_sweep").classes("glass-wide")
-                clear_btn.on_click(lambda: log_el.clear())
-            log_el = ui.log(max_lines=300).classes("glass-log w-full")
-
-    ui.timer(2.0, refresh_status)
-    log_msg("Application ready. Press Connect to start ADS communication.")
+            self.connect_btn.enable()
+            await self.refresh_status()
 
 
-app.on_shutdown(plc.close)
+@ui.page("/")
+def index() -> None:
+    ui.add_css(CSS)
+    ui.query("body").classes("q-pa-md")
+    ControlPanel()
+
+
+app.on_shutdown(plc.close)  # close the link and stop the ADS worker thread
 
 if __name__ in {"__main__", "__mp_main__"}:  # guard required when packaged as .exe
     ui.run(title="Roll magazine control", port=8080, reload=True, native=True, favicon="./asset/Detective.ico", fullscreen=False)

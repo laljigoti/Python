@@ -1,22 +1,36 @@
 """ADS communication module (TwinCAT <-> Python).
 
 Kept free of any UI code so it can be reused and tested on its own.
-All ADS calls run on ONE dedicated worker thread, so writes reach the PLC
-in exactly the order they were requested (press -> release never swaps).
+
+Design rules
+------------
+* Every ADS call runs on ONE dedicated worker thread (``max_workers=1``).
+  That gives strict FIFO ordering, so writes reach the PLC in exactly the
+  order they were requested (e.g. "button pressed" never overtakes
+  "button released").
+* A lock additionally protects the connection object, so the blocking
+  (sync) methods are also safe to call from other threads.
+* Every blocking method has an ``*_async`` twin that hands the work to the
+  worker thread, so async code (e.g. NiceGUI handlers) never blocks the
+  event loop.
 """
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 import threading
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable, Iterator, TypeVar
 
 import pyads
 
 log = logging.getLogger(__name__)
+
+T = TypeVar("T")
 
 # Config "type" string -> pyads data type
 _TYPE_MAP: dict[str, Any] = {
@@ -34,11 +48,16 @@ _TYPE_MAP: dict[str, Any] = {
     "LREAL": pyads.PLCTYPE_LREAL,
 }
 
+_NOT_CONNECTED_MSG = "Not connected to the PLC. Press Connect first."
+
 
 class AdsError(Exception):
     """Raised when an ADS operation fails."""
 
 
+# --------------------------------------------------------------------------
+# Configuration
+# --------------------------------------------------------------------------
 @dataclass(frozen=True)
 class PlcVariable:
     name: str          # full symbol path in the PLC
@@ -54,7 +73,9 @@ class AdsConfig:
 
     @classmethod
     def from_file(cls, path: str | Path) -> "AdsConfig":
+        """Load and validate the JSON configuration file."""
         data = json.loads(Path(path).read_text(encoding="utf-8"))
+
         variables = tuple(
             PlcVariable(
                 name=v["name"],
@@ -63,145 +84,161 @@ class AdsConfig:
             )
             for v in data["PLC_Var"]
         )
-        for v in variables:
-            if v.type not in _TYPE_MAP:
-                raise ValueError(f"Unsupported PLC type '{v.type}' for {v.name}")
+
+        # Fail early on typos instead of at the first read/write.
+        for var in variables:
+            if var.type not in _TYPE_MAP:
+                raise ValueError(f"Unsupported PLC type '{var.type}' for {var.name}")
+
         return cls(data["plc_ams_id"], int(data["plc_port"]), variables)
 
 
+# --------------------------------------------------------------------------
+# Client
+# --------------------------------------------------------------------------
 class AdsClient:
-    """Thread-safe wrapper around a pyads connection with auto-reconnect."""
+    """Thread-safe wrapper around a pyads connection.
+
+    The client never connects silently: call ``connect()`` / ``connect_async()``
+    first. After any ADS failure the link is closed and must be re-opened
+    explicitly.
+    """
 
     def __init__(self, config: AdsConfig) -> None:
         self._cfg = config
+        # name -> pyads type, for O(1) lookup when writing
         self._types = {v.name: _TYPE_MAP[v.type] for v in config.variables}
         self._conn: pyads.Connection | None = None
         self._lock = threading.Lock()
         # max_workers=1 -> strict FIFO ordering of all ADS calls
         self._executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="ads")
 
+    # ---------- internal helpers ----------
+    async def _run(self, func: Callable[..., T], *args: Any) -> T:
+        """Run a blocking method on the ADS worker thread without blocking the event loop."""
+        loop = asyncio.get_running_loop()
+        return await loop.run_in_executor(self._executor, func, *args)
+
+    @contextmanager
+    def _session(self, action: str) -> Iterator[pyads.Connection]:
+        """Lock the client and yield the open connection.
+
+        * Raises ``AdsError`` if there is no open connection.
+        * If the ADS call inside the ``with`` block fails, the link is closed
+          (it is considered broken) and the error is re-raised as ``AdsError``.
+        """
+        with self._lock:
+            conn = self._conn
+            if conn is None or not conn.is_open:
+                raise AdsError(_NOT_CONNECTED_MSG)
+            try:
+                yield conn
+            except pyads.ADSError as exc:
+                log.warning("ADS %s failed: %s", action, exc)
+                self._close_unlocked()
+                raise AdsError(f"{action} failed: {exc}") from exc
+
+    def _close_unlocked(self) -> None:
+        """Close the connection. The caller must already hold ``self._lock``."""
+        if self._conn is None:
+            return
+        try:
+            self._conn.close()
+        except pyads.ADSError:
+            pass  # already broken - nothing more to do
+        self._conn = None
+
     # ---------- connection ----------
     @property
     def connected(self) -> bool:
-        conn = self._conn
-        if conn is None or not conn.is_open:
-            return False
-        try:
-            state = conn.read_state()  # cheap round-trip to verify the link
-            return state is not None
-        except pyads.ADSError:
-            return False
+        """True if the link is open AND the PLC answers (cheap round-trip)."""
+        with self._lock:
+            conn = self._conn
+            if conn is None or not conn.is_open:
+                return False
+            try:
+                return conn.read_state() is not None
+            except pyads.ADSError:
+                return False
 
     def connect(self) -> None:
+        """Open a fresh connection (any previous one is closed first)."""
         with self._lock:
             self._close_unlocked()
+            conn = pyads.Connection(self._cfg.ams_id, self._cfg.port)
             try:
-                conn = pyads.Connection(self._cfg.ams_id, self._cfg.port)
                 conn.open()
-                conn.read_state()
+                conn.read_state()  # verify the PLC really answers
             except pyads.ADSError as exc:
-                raise AdsError(f"Cannot connect to {self._cfg.ams_id}:{self._cfg.port} - {exc}") from exc
+                try:
+                    conn.close()  # don't leak a half-open connection
+                except pyads.ADSError:
+                    pass
+                raise AdsError(
+                    f"Cannot connect to {self._cfg.ams_id}:{self._cfg.port} - {exc}"
+                ) from exc
             self._conn = conn
             log.info("ADS connected to %s:%s", self._cfg.ams_id, self._cfg.port)
 
-    def close(self) -> None:
+    def disconnect(self) -> None:
+        """Close the ADS connection. The client can be connected again later."""
         with self._lock:
             self._close_unlocked()
+
+    def close(self) -> None:
+        """Disconnect AND shut down the worker thread (final; call on app exit)."""
+        self.disconnect()
         self._executor.shutdown(wait=False)
 
-    def _close_unlocked(self) -> None:
-        if self._conn is not None:
-            try:
-                self._conn.close()
-            except pyads.ADSError:
-                pass
-            self._conn = None
+    # ---------- reading ----------
+    def read_many(self, names: list[str]) -> dict[str, Any]:
+        """Blocking batched read of several variables (one ADS round-trip)."""
+        with self._session("Read") as conn:
+            return dict(conn.read_list_by_name(names))
 
     # ---------- writing ----------
     def write(self, name: str, value: Any) -> None:
-        """Blocking write. Requires an explicit connect() first (no silent auto-connect)."""
+        """Blocking write of a single variable."""
         plc_type = self._types.get(name)
         if plc_type is None:
             raise AdsError(f"Variable not in config: {name}")
-        with self._lock:
-            if self._conn is None or not self._conn.is_open:
-                raise AdsError("Not connected to the PLC. Press Connect first.")
-            try:
-                self._conn.write_by_name(name, value, plc_type)
-            except pyads.ADSError as exc:
-                log.warning("ADS write failed (%s): %s", name, exc)
-                self._close_unlocked()  # link is bad; user must reconnect
-                raise AdsError(f"Write failed for {name}: {exc}") from exc
-
-    def read_many(self, names: list[str]) -> dict[str, Any]:
-        """Blocking batched read (one ADS round-trip) of several variables."""
-        with self._lock:
-            if self._conn is None or not self._conn.is_open:
-                raise AdsError("Not connected to the PLC. Press Connect first.")
-            try:
-                return dict(self._conn.read_list_by_name(names))
-            except pyads.ADSError as exc:
-                log.warning("ADS read failed: %s", exc)
-                self._close_unlocked()
-                raise AdsError(f"Read failed: {exc}") from exc
-
-    async def read_many_async(self, names: list[str]) -> dict[str, Any]:
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, self.read_many, names)
+        with self._session(f"Write of {name}") as conn:
+            conn.write_by_name(name, value, plc_type)
 
     def write_many(self, values: dict[str, Any]) -> None:
-        """Blocking batched write (one ADS round-trip) of several variables."""
-        for name in values:
-            if name not in self._types:
-                raise AdsError(f"Variable not in config: {name}")
-        with self._lock:
-            if self._conn is None or not self._conn.is_open:
-                raise AdsError("Not connected to the PLC. Press Connect first.")
-            try:
-                result = self._conn.write_list_by_name(values)
-            except pyads.ADSError as exc:
-                log.warning("ADS batch write failed: %s", exc)
-                self._close_unlocked()
-                raise AdsError(f"Write failed: {exc}") from exc
+        """Blocking batched write of several variables (one ADS round-trip)."""
+        unknown = [name for name in values if name not in self._types]
+        if unknown:
+            raise AdsError(f"Variable(s) not in config: {', '.join(unknown)}")
+
+        with self._session("Batch write") as conn:
+            result = conn.write_list_by_name(values)
+
+        # pyads reports a per-variable status string; anything but "no error" is a failure.
         failed = {n: r for n, r in result.items() if str(r).lower() != "no error"}
         if failed:
-            raise AdsError(f"{len(failed)} variable(s) could not be written: {next(iter(failed.values()))}")
+            details = ", ".join(f"{n}: {r}" for n, r in failed.items())
+            raise AdsError(f"{len(failed)} variable(s) could not be written ({details})")
 
-    async def write_many_async(self, values: dict[str, Any]) -> None:
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, self.write_many, values)
-
-    async def write_async(self, name: str, value: Any) -> None:
-        """Non-blocking write for use from async code (NiceGUI handlers)."""
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, self.write, name, value)
-
+    # ---------- async API (for NiceGUI / asyncio code) ----------
     async def connect_async(self) -> None:
         """Open the ADS connection without blocking the event loop."""
-        import asyncio
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, self.connect)
+        await self._run(self.connect)
 
     async def disconnect_async(self) -> None:
         """Close the ADS connection (the client can be connected again later)."""
-        import asyncio
-
-        def _disconnect() -> None:
-            with self._lock:
-                self._close_unlocked()
-
-        loop = asyncio.get_running_loop()
-        await loop.run_in_executor(self._executor, _disconnect)
+        await self._run(self.disconnect)
 
     async def connected_async(self) -> bool:
-        import asyncio
+        """Check the link state without blocking the event loop."""
+        return await self._run(lambda: self.connected)
 
-        loop = asyncio.get_running_loop()
-        return await loop.run_in_executor(self._executor, lambda: self.connected)
+    async def read_many_async(self, names: list[str]) -> dict[str, Any]:
+        return await self._run(self.read_many, names)
+
+    async def write_async(self, name: str, value: Any) -> None:
+        """Non-blocking write for use from async code (NiceGUI handlers)."""
+        await self._run(self.write, name, value)
+
+    async def write_many_async(self, values: dict[str, Any]) -> None:
+        await self._run(self.write_many, values)
