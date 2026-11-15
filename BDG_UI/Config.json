@@ -1,7 +1,9 @@
 {
-    "plc_ams_id": "192.168.2.139.1.1",
+    "plc_ams_id": "192.168.2.217.1.1",
     "plc_port": 851,
     "PLC_Var": [
+        {"name": "GVL.un01D2602T02GlueApplicator.stAxisStatus.GlueRoller.Moving", "type": "BOOL", "display_name": "GlueRoller"},
+        {"name": "GVL.un01D2602T02GlueApplicator.su01GlueHeater.fg01GlueRollHeater.fb01GlueRollHeater.fActValue", "type": "LREAL", "display_name": "Glue Temperature"},
         {"name": "GVL.un01D2133T01Magazine.su01RollMagazine.fg01Track.fb01TrackBasic.stOperating.stManuellClamping.bPressed", "type": "BOOL", "display_name": "1"},
         {"name": "GVL.un01D2133T01Magazine.su01RollMagazine.fg02Track.fb01TrackBasic.stOperating.stManuellClamping.bPressed", "type": "BOOL", "display_name": "2"},
         {"name": "GVL.un01D2133T01Magazine.su01RollMagazine.fg03Track.fb01TrackBasic.stOperating.stManuellClamping.bPressed", "type": "BOOL", "display_name": "3"}, 

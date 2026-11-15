@@ -65,7 +65,7 @@ class PlcVariable:
     display_name: str  # label shown in the UI
 
 
-@dataclass(frozen=True)
+@dataclass(frozen=True) #once initialized, cannot be changed
 class AdsConfig:
     ams_id: str
     port: int

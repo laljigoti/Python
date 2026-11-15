@@ -61,6 +61,7 @@ class RowSpec(NamedTuple):
     mode: str     # "toggle": click = switch on/off and stay (state mirrored from the PLC)
                   # "hold"  : TRUE while the button is held, FALSE on release
     prefix: str   # short word used in log lines, e.g. "Clamp 3"
+    haveMaster: bool   # short word used in log lines, e.g. "Clamp 3"
 
 
 # --------------------------------------------------------------------------- custom icons
@@ -80,21 +81,21 @@ def svg_icon(svg: str) -> str:
 # The viewBox is slightly larger than the drawing (-5..105) so the round stroke ends aren't clipped.
 ROLLER_CLAMP_ICON = svg_icon(
     """
-    <svg xmlns="http://www.w3.org/2000/svg" viewBox="-5 -5 110 110"
+    <svg xmlns="http://www.w3.org/2000/svg" viewBox="-9 -9 118 118"
          fill="none" stroke="#ffffff" stroke-width="7" stroke-linecap="round">
-      <circle cx="24" cy="50" r="24"/>   <!-- left roller: outer ring -->
-      <circle cx="24" cy="50" r="11"/>   <!-- left roller: hub -->
-      <circle cx="76" cy="50" r="24"/>   <!-- right roller: outer ring -->
-      <circle cx="76" cy="50" r="11"/>   <!-- right roller: hub -->
+      <circle cx="20" cy="50" r="24"/>   <!-- left roller: outer ring -->
+      <circle cx="20" cy="50" r="8" fill="green"/>   <!-- left roller: hub -->
+      <circle cx="80" cy="50" r="24"/>   <!-- right roller: outer ring -->
+      <circle cx="80" cy="50" r="8" fill="white"/>   <!-- right roller: hub -->
       <line x1="50" y1="0" x2="50" y2="100"/>   <!-- strip between the rollers -->
     </svg>
     """
 )
 
 ROWS = (
-    RowSpec("stManuellClamping", "Flat Clamping", "compress", "toggle", "FlatClamp"),
-    RowSpec("stFeedRollerClamping", "Roller Clamping", ROLLER_CLAMP_ICON, "toggle", "RollerClamp"),
-    RowSpec("stGoToParkPos", "Go to park position", "local_parking", "hold", "Park"),
+    RowSpec("stManuellClamping", "Flat Clamping", "compress", "toggle", "FlatClamp", True),
+    RowSpec("stFeedRollerClamping", "Roller Clamping", ROLLER_CLAMP_ICON, "toggle", "RollerClamp", False),
+    RowSpec("stGoToParkPos", "Go to park position", "local_parking", "hold", "Park", False),
 )
 
 # --------------------------------------------------------------------------- style
@@ -311,8 +312,8 @@ class ControlPanel:
         """Heading (+ 'Clamp all' for toggle rows) and one button per matching PLC variable."""
         with ui.row().classes("w-full items-center justify-between q-mt-md q-mb-sm"):
             ui.label(spec.title).classes("text-subtitle1 text-weight-medium glass-sub")
-            if spec.mode == "toggle":
-                self.master_btn = glass_button("Clamp all", "lock").classes("glass-wide")
+            if spec.mode == "toggle" and spec.haveMaster:
+                self.master_btn = glass_button("Release all", "lock").classes("glass-wide")
                 self.master_btn.on_click(self.toggle_all)
                 self.plc_buttons.append(self.master_btn)
 
@@ -392,8 +393,9 @@ class ControlPanel:
     # ---- toggle buttons -----------------------------------------------------
     @property
     def all_clamped(self) -> bool:
-        return bool(self.toggle_buttons) and all(self.toggle_state.get(n, False) for n in self.toggle_buttons)
-
+        # Return True if every toggle button is ON, else False. If there are no toggle buttons, return False.
+        return bool(self.toggle_buttons) and all(self.toggle_state.get(n, False) for n in self.toggle_buttons if 'stManuellClamping' in n)
+        # bool(object) is False for empty dicts, so "all clamps on" is False when there are no toggle buttons.
     def apply_states(self, states: dict[str, bool]) -> None:
         """Show PLC values on the toggle buttons. Only touches the UI for values that changed."""
         changed = False
@@ -410,7 +412,7 @@ class ControlPanel:
         if self.master_btn is None:
             return
         all_on = self.all_clamped
-        self.master_btn.set_text("Release all" if all_on else "Clamp all")
+        self.master_btn.set_text("Clamp all" if all_on else "Release all")
         set_class(self.master_btn, "is-on", all_on)
 
     async def toggle(self, name: str) -> None:
@@ -422,7 +424,9 @@ class ControlPanel:
     async def toggle_all(self) -> None:
         """Not all clamps on -> switch ALL on.  All clamps on -> switch ALL off."""
         target = not self.all_clamped
-        states = {name: target for name in self.toggle_buttons}
+        states = {name: target for name in self.toggle_buttons if 'stManuellClamping' in name}
+        #states = {k: v for k, v in states.items() if 'stManuellClamping' in k}
+        
         if await self.attempt("Clamp all", plc.write_many_async(states)):  # one ADS round-trip
             self.apply_states(states)
             self.log(f"All {len(states)} clamps -> {'ON' if target else 'OFF'}", "ok" if target else "info")
